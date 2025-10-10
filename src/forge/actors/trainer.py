@@ -46,6 +46,8 @@ from forge.actors._torchstore_utils import (
 
 from forge.controller import ForgeActor
 from forge.data.utils import batch_to_device
+
+from forge.data_models.loss_metrics import LossMetrics
 from forge.observability.metrics import record_metric, Reduce
 from forge.observability.perf_tracker import Tracer
 
@@ -176,7 +178,7 @@ class RLTrainer(ForgeActor):
 
     def forward_backward(
         self, inputs: dict[str, Tensor], targets: dict[str, Tensor]
-    ) -> Tensor:
+    ) -> Tensor | LossMetrics:
         model_parts = self.engine.model_parts
         parallel_dims = self.engine.parallel_dims
 
@@ -233,12 +235,12 @@ class RLTrainer(ForgeActor):
                 assert len(model_parts) == 1
                 with self.engine.maybe_enable_amp:
                     logits = model_parts[0](**inputs)
-                    loss = self.loss(logits, **targets)
+                    loss, loss_metrics = self.loss(logits, **targets)
                 # need to free to before bwd to avoid peaking memory
                 del logits
                 loss.backward()
 
-        return loss
+        return loss, loss_metrics
 
     @endpoint
     async def train_step(
@@ -261,7 +263,7 @@ class RLTrainer(ForgeActor):
         #     self.model,
         #     self.data_parallel_size,
         # ) as grad_acc:
-        loss = self.forward_backward(local_inputs, local_targets)
+        loss, loss_metrics = self.forward_backward(local_inputs, local_targets)
         torch.distributed.all_reduce(loss)
         t.step("forward_backward")
 
@@ -284,11 +286,24 @@ class RLTrainer(ForgeActor):
         record_metric("rl_trainer/count_training_steps", 1, Reduce.SUM)
         record_metric("rl_trainer/avg_grpo_loss", loss, Reduce.MEAN)
 
-        # TODO: Extract actual KL divergence and policy entropy from the loss computation
-        # These are placeholder values until the loss function exposes these metrics
-        # record_metric("rl_trainer/step/avg_kl_divergence", 0.0, Reduce.MEAN)
-        # record_metric("rl_trainer/step/std_kl_divergence", 0.0, Reduce.STD)
-        # record_metric("rl_trainer/step/avg_policy_entropy", 0.0, Reduce.MEAN)
+        if loss_metrics.kl_divergence.sum().item() != 0:
+            record_metric(
+                "rl_trainer/step/avg_kl_divergence",
+                loss_metrics.kl_divergence,
+                Reduce.MEAN,
+            )
+            record_metric(
+                "rl_trainer/step/std_kl_divergence",
+                loss_metrics.kl_divergence,
+                Reduce.STD,
+            )
+
+        if loss_metrics.policy_entropy.sum().item() != 0:
+            record_metric(
+                "rl_trainer/step/avg_policy_entropy",
+                loss_metrics.policy_entropy,
+                Reduce.MEAN,
+            )
 
         self.step += 1
         self.engine.checkpointer.save(

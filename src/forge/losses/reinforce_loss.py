@@ -7,6 +7,8 @@
 import torch
 from torch import nn
 
+from forge.data_models.loss_metrics import LossMetrics
+
 from forge.util.ops import selective_log_softmax
 
 
@@ -28,7 +30,7 @@ class ReinforceLoss(nn.Module):
 
     def forward(
         self, trainer_logits, target_ids, target_mask, target_weights, target_log_probs
-    ):
+    ) -> tuple[torch.Tensor, LossMetrics]:
         trainer_log_probs = selective_log_softmax(trainer_logits, target_ids)
         target_mask = target_mask.detach()
         target_weights = target_weights
@@ -47,4 +49,6 @@ class ReinforceLoss(nn.Module):
         numerator = (-trainer_log_probs * weighted_advantages * target_mask).sum()
 
         denominator = target_mask_sum
-        return numerator / denominator
+        return numerator / denominator, LossMetrics(
+            kl_divergence=torch.tensor(0), policy_entropy=torch.tensor(0)
+        )
