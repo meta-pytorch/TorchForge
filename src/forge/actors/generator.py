@@ -13,10 +13,12 @@ import sys
 from collections.abc import Mapping
 from copy import copy
 from dataclasses import dataclass, field
+from typing import Optional
 
 import torch
 import torchstore as ts
-from monarch.actor import current_rank, endpoint, ProcMesh
+from monarch.actor import current_rank, endpoint, ProcMesh, this_host
+
 from vllm.config import VllmConfig
 
 from vllm.engine.arg_utils import EngineArgs
@@ -60,6 +62,7 @@ from forge.data_models.prompt import to_prompt
 from forge.observability.metrics import record_metric, Reduce
 from forge.observability.perf_tracker import Tracer
 from forge.types import ProcessConfig
+from forge.util._shared_tensor import SharedTensor, SharedTensorHandle
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -92,6 +95,8 @@ class Generator(ForgeActor):
     engine_args: EngineArgs | Mapping = field(default_factory=EngineArgs)
     sampling_params: SamplingParams | Mapping = field(default_factory=SamplingParams)
     use_dcp_for_weight_sync: bool | None = None
+    prefetch_weights_to_shm: bool = True
+    n_fetcher_procs: int = 8
 
     def __post_init__(self):
         super().__init__()
@@ -226,10 +231,60 @@ class Generator(ForgeActor):
             log_stats=None,
         )
         self._start_processing()
+        if self.prefetch_weights_to_shm:
+            self._spawn_fetchers()
+
+    def _spawn_fetchers(self):
+        """Spawn weight fetchers that prefetch weights from torchstore to shared memory."""
+        # TODO: this assumes the generator is on the same host as the worker
+        # and only works for single host generators. Figure out how to support
+        # generators with workers spanned across multiple hosts.
+        fetcher_procs = this_host().spawn_procs(
+            per_host={"procs": self.n_fetcher_procs}
+        )
+        self._fetcher_procs = fetcher_procs
+        self.weight_fetchers = fetcher_procs.spawn("weight_fetcher", _WeightFetcher)
 
     def _start_processing(self):
         if self._run_task is None or self._run_task.done():
             self._run_task = asyncio.create_task(self.run())
+
+    async def _drop_shared_memory(self, state_dict: dict[str, SharedTensorHandle]):
+        for handle in state_dict.values():
+            handle.drop()
+
+    async def _fetch_weights(
+        self,
+        version: int,
+    ) -> dict[str, SharedTensorHandle]:
+        """Fetch weights from torchstore and return a dict of {name: SharedTensorHandle}."""
+        t = Tracer("generator_perf/_fetch_weights")
+        t.start()
+        prefix = get_param_prefix(version)
+        matching_keys = await ts.keys(prefix)
+        hf_param_names = [extract_param_name(key) for key in matching_keys]
+
+        n_fetchers = self.weight_fetchers.size()
+
+        def split_keys(keys):
+            return [keys[i::n_fetchers] for i in range(n_fetchers)]
+
+        futures = []
+        for i, names in enumerate(split_keys(hf_param_names)):
+            fut = self.weight_fetchers.slice(procs=i).fetch.call_one(
+                version=version, param_names=names
+            )
+            futures.append(fut)
+
+        sub_state_dicts = [await fut for fut in futures]
+
+        state_dict = {}
+        for sd in sub_state_dicts:
+            state_dict.update(sd)
+
+        t.stop()
+
+        return state_dict
 
     @endpoint
     async def generate(self, prompt: str, *, priority: int = 0) -> list[Completion]:
@@ -384,6 +439,12 @@ class Generator(ForgeActor):
             >>> await trainer.push_weights()
             >>> generator.update_weights(version)
         """
+        # TODO: enable shared memory prefetch for DCP-based weight sync
+        if self.prefetch_weights_to_shm and not self.use_dcp_for_weight_sync:
+            logger.info(f"[Generator] Fetching weights for v{version} to shared memory")
+            fetch_fut = asyncio.create_task(self._fetch_weights(version))
+        else:
+            fetch_fut = None
         # Serialize updates (only one update at a time)
         async with self.update_lock:
             # Grab the lock to stop accepting requests and wait on pending requests
@@ -415,8 +476,19 @@ class Generator(ForgeActor):
             )
 
             logger.debug(f"Starting weight update on {self.__class__.__name__}")
-            # Call update_weights on every generator worker
-            await self.worker.update_weights.call(version=version)
+
+            if fetch_fut is not None:
+                t = Tracer("generator_perf/waiting_for_fetch_weights")
+                t.start()
+                fetched_weights = await fetch_fut
+                t.stop()
+                # Call update_weights on every policy_worker
+                await self.worker.update_weights.call(
+                    shared_memory_state_dict=fetched_weights
+                )
+                await self._drop_shared_memory(fetched_weights)
+            else:
+                await self.worker.update_weights.call(version=version)
             self.generator_version = version
 
             # After updating the weights, we need to reset the KV cache
@@ -490,6 +562,7 @@ class Generator(ForgeActor):
         await actor.stop.call()
         await stop_proc_mesh(actor._worker_procs)
         await stop_proc_mesh(actor._generator_proc)
+        await stop_proc_mesh(actor._fetcher_procs)
 
     @endpoint
     async def _test_save_model_params(self):
@@ -573,14 +646,41 @@ class GeneratorWorker(ForgeActor):
         return self.worker.execute_model(schedule)
 
     @endpoint
-    async def update_weights(self, version: int) -> None:
+    async def update_weights(
+        self,
+        version: Optional[int] = None,
+        *,
+        shared_memory_state_dict: Optional[dict[str, SharedTensorHandle]] = None,
+    ) -> None:
         model = self.worker.model_runner.model
+        if shared_memory_state_dict is not None:
+            logger.info("[PolicyWorker] update weights from shared memory.")
+            t = Tracer(
+                "generator_worker_perf/update_weights_from_shared_memory", timer="gpu"
+            )
+            t.start()
+            loaded_weights = set()
+            for name, param_handle in shared_memory_state_dict.items():
+                # Use context manager for automatic cleanup
+                with param_handle.to_shared_tensor() as shared_tensor:
+                    param = shared_tensor.tensor
+                    loaded = model.load_weights([(name, param)])
+                    loaded_weights.update(loaded)
+            logger.info(f"[PolicyWorker] updated {len(loaded_weights)} paremeters")
+            t.stop()
+            return
+        # normal update_weights without shared memory prefetching
+        if version is None:
+            raise ValueError(
+                "version must be provided if not using shared_memory_state_dict"
+            )
+        logger.info("[PolicyWorker] update weights from torchstore.")
         prefix = get_param_prefix(version)
         matching_keys = await ts.keys(prefix)
         dcp_whole_state_dict_key = get_dcp_whole_state_dict_key(version)
         use_dcp_for_weight_sync = dcp_whole_state_dict_key in matching_keys
         loaded_weights = set()
-        t = Tracer("worker_perf/update_weights", timer="gpu")
+        t = Tracer("generator_worker_perf/update_weights_from_torchstore", timer="gpu")
         t.start()
 
         if use_dcp_for_weight_sync:
@@ -622,3 +722,26 @@ class GeneratorWorker(ForgeActor):
         return validate_fn(
             self._test_prev_params, self.worker.model_runner.model, logger
         )
+
+
+class _WeightFetcher(ForgeActor):
+    """Fetches weights from torchstore and loads them into shared memory.
+    This has to be colocated with the GeneratorWorker."""
+
+    @endpoint
+    async def fetch(
+        self,
+        *,
+        version: int,
+        param_names: list[str],
+    ) -> dict[str, SharedTensorHandle]:
+        """Fetch weights from torchstore and load them into shared memory."""
+        sd = {}
+        for name in param_names:
+            param_key = get_param_key(version, name)
+            param = await ts.get(param_key)
+            # Use context manager to ensure cleanup after getting handle
+            with SharedTensor(tensor=param) as shared_tensor:
+                handle = shared_tensor.get_handle()
+                sd[name] = handle
+        return sd

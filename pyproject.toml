@@ -42,6 +42,7 @@ dev = [
     "tomli>=1.1.0",
     "anyio",
     "pytest-asyncio",
+    "multiprocess",
 ]
 oss = [
     "torch",
