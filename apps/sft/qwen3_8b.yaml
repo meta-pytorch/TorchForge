@@ -25,13 +25,26 @@ optimizer:
 lr_scheduler:
   warmup_steps: 200
 
+# Dataset configuration
+dataset:
+  path: "yahma/alpaca-cleaned"
+  split: "train[:95%]"
+
+dataset_val:
+  path: "yahma/alpaca-cleaned"
+  split: "train[95%:]"
+
 training:
   local_batch_size: 1
   seq_len: 2048
   max_norm: 1.0
   steps: 1000
   compile: false
-  dataset: "c4"
+
+validation:
+  enabled: true       # Enable/disable validation
+  eval_interval: 100  # Run evaluation every 100 training steps
+  eval_steps: 50      # Number of batches per evaluation (0 = full epoch)
 
 parallelism:
   data_parallel_replicate_degree: 1
