@@ -140,8 +140,8 @@ html_theme_options = {
     "navbar_center": "navbar-nav",
     "canonical_url": "https://meta-pytorch.org/forge/",
     "header_links_before_dropdown": 7,
-    "show_nav_level": 2,
     "show_toc_level": 2,
+    "navigation_depth": 3,
 }
 
 theme_variables = pytorch_sphinx_theme2.get_theme_variables()
@@ -173,6 +173,7 @@ myst_enable_extensions = [
     "colon_fence",
     "deflist",
     "html_image",
+    "substitution",
 ]
 
 # Configure MyST parser to treat mermaid code blocks as mermaid directives
