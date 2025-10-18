@@ -31,6 +31,55 @@ jobs:
     steps:
       - name: Check out repo
         uses: actions/checkout@v4
+      - name: Install enroot
+        run: |
+          version="3.5.0"
+
+          # Install only required dependencies (curl, pigz, zstd are likely already installed)
+          sudo dnf install -y jq squashfs-tools parallel
+
+          # Download pre-built packages
+          curl -fSsL -O https://github.com/NVIDIA/enroot/releases/download/v${version}/enroot-${version}-1.el8.x86_64.rpm
+          curl -fSsL -O https://github.com/NVIDIA/enroot/releases/download/v${version}/enroot+caps-${version}-1.el8.x86_64.rpm
+
+          # Install packages
+          sudo rpm -ivh enroot-${version}-1.el8.x86_64.rpm enroot+caps-${version}-1.el8.x86_64.rpm
+
+          rm -f enroot*.rpm
+
+          # Create user-writable directories for enroot
+          mkdir -p ${HOME}/.local/share/enroot/{runtime,cache,data,temp}
+
+          # Create a system-wide config for enroot (since GITHUB_ENV doesn't work for spawned processes)
+          sudo mkdir -p /etc/enroot
+          sudo tee /etc/enroot/enroot.conf > /dev/null <<EOF
+          ENROOT_RUNTIME_PATH ${HOME}/.local/share/enroot/runtime
+          ENROOT_CACHE_PATH ${HOME}/.local/share/enroot/cache
+          ENROOT_DATA_PATH ${HOME}/.local/share/enroot/data
+          ENROOT_TEMP_PATH ${HOME}/.local/share/enroot/temp
+          EOF
+
+          # Also set env vars for current process
+          echo "ENROOT_RUNTIME_PATH=${HOME}/.local/share/enroot/runtime" >> $GITHUB_ENV
+          echo "ENROOT_CACHE_PATH=${HOME}/.local/share/enroot/cache" >> $GITHUB_ENV
+          echo "ENROOT_DATA_PATH=${HOME}/.local/share/enroot/data" >> $GITHUB_ENV
+          echo "ENROOT_TEMP_PATH=${HOME}/.local/share/enroot/temp" >> $GITHUB_ENV
+      - name: Test enroot installation
+        run: |
+          # Verify enroot is installed and check version
+          enroot version
+
+          # Test importing a simple image
+          enroot import -o /tmp/test_alpine.sqsh docker://alpine:latest
+          ls -lh /tmp/test_alpine.sqsh
+
+          # Create and test container
+          enroot create --name test_alpine /tmp/test_alpine.sqsh
+          enroot start test_alpine echo "Hello from enroot!"
+          enroot remove -f test_alpine
+          rm -f /tmp/test_alpine.sqsh
+
+          echo "Enroot test successful!"
       - name: Setup conda env
         uses: conda-incubator/setup-miniconda@v2
         with:
