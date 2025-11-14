@@ -4,20 +4,24 @@
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
 
+import asyncio
+import heapq
+import itertools
+import json
 import logging
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Dict, List
 
 import pytz
-from monarch.actor import current_rank
 
 from forge.observability.utils import get_proc_name_with_rank
 
 from forge.util.logging import get_logger, log_once
+from monarch.actor import current_rank
 
 logger = get_logger("INFO")
 
@@ -68,6 +72,7 @@ class Reduce(Enum):
     MAX = "max"
     MIN = "min"
     STD = "std"
+    SAMPLE = "sample"
 
     @property
     def accumulator_class(self):
@@ -77,6 +82,7 @@ class Reduce(Enum):
             Reduce.MAX: MaxAccumulator,
             Reduce.MIN: MinAccumulator,
             Reduce.STD: StdAccumulator,
+            Reduce.SAMPLE: SampleAccumulator,
         }
         return mapping[self]
 
@@ -135,12 +141,25 @@ def reduce_metrics_states(states: list[dict[str, dict[str, Any]]]) -> list[Metri
         list[Metric]: List of reduced metrics
 
     Example:
-        states = [
-            {"loss": {"count": 5, "sum": 14, "reduction_type": Reduce.MEAN}},
-            {"loss": {"count": 10, "sum": 16, "reduction_type": Reduce.MEAN}},
+        >>> states = [
+        ...     {
+        ...         "loss": {"count": 5, "sum": 14, "reduction_type": "mean"},
+        ...         "reward/sample": {
+        ...             "reduction_type": "sample",
+        ...             "samples": [{"episode_id": 1, "reward": 0.5}],
+        ...         },
+        ...     },
+        ...     {"loss": {"count": 10, "sum": 16, "reduction_type": Reduce.MEAN}},
+        ... ]
+        >>> reduce_metrics_states(states)
+        [
+            Metric(key='loss', value=2.0, reduction=Reduce.MEAN),
+            Metric(
+                key='reward/sample',
+                value=[{'episode_id': 1, 'reward': 0.5}],
+                reduction=Reduce.SAMPLE,
+            )
         ]
-        reduce_metrics_states(states)
-        >>> [Metric(key="loss", value=2.0, reduction=Reduce.MEAN)]
 
     Raises:
         ValueError: on mismatched reduction types for the same metric key.
@@ -180,6 +199,17 @@ def reduce_metrics_states(states: list[dict[str, dict[str, Any]]]) -> list[Metri
         reduced_metrics.append(metric)
 
     return reduced_metrics
+
+
+def record_episode_sample(table_name: str, episode):
+    """
+    Record a structured sample-level log for a single episode.
+    Args:
+        table_name (str): logging prefix (e.g. "rollout/sample").
+        episode (Episode): episode object with filled attributes.
+    """
+    sample = episode.to_dict(exclude=["ref_logprobs", "completion"])
+    record_metric(table_name, sample, Reduce.SAMPLE)
 
 
 ################
@@ -392,6 +422,79 @@ class StdAccumulator(MetricAccumulator):
         self.count = 0
 
 
+class SampleAccumulator(MetricAccumulator):
+    """Accumulator for sample-level metrics with top-k and bottom-k filtering.
+
+    Keeps the top-k and bottom-k samples by a given key (e.g., reward).
+    Useful for logging only the best and worst samples from a batch.
+    """
+
+    def __init__(
+        self, reduction: Reduce, top_k: int = 1, bottom_k: int = 1, key: str = "reward"
+    ):
+        super().__init__(reduction)
+        self.samples: List[Dict[str, Any]] = []
+        self.top_k = top_k
+        self.bottom_k = bottom_k
+        self.key = key
+        self._top_heap = []  # min-heap for top-k
+        self._bottom_heap = []  # max-heap for bottom-k (store -value)
+        self._counter = itertools.count()  # tie-breaker id generator
+        self.is_reset = True
+
+    def append(self, value: dict) -> None:
+        if not isinstance(value, dict):
+            raise ValueError(f"Expected dict, got {type(value)}")
+
+        self.is_reset = False
+        val = value.get(self.key, 0.0)
+        idx = next(self._counter)  # unique tiebreaker
+
+        # If top_k or bottom_k <= 0, it means "disable" that side of filtering (i.e., keep none).
+        # maintain top-k
+        if self.top_k > 0:
+            if len(self._top_heap) < self.top_k:
+                heapq.heappush(self._top_heap, (val, idx, value))
+            else:
+                heapq.heappushpop(self._top_heap, (val, idx, value))
+
+        # maintain bottom-k
+        if self.bottom_k > 0:
+            if len(self._bottom_heap) < self.bottom_k:
+                heapq.heappush(self._bottom_heap, (-val, idx, value))
+            else:
+                heapq.heappushpop(self._bottom_heap, (-val, idx, value))
+
+    def get_value(self) -> list[dict]:
+        """Return top-k and bottom-k filtered samples."""
+        tops = [s for _, _, s in self._top_heap]
+        bottoms = [s for _, _, s in self._bottom_heap]
+        return bottoms + tops
+
+    def get_state(self) -> Dict[str, Any]:
+        """Serialize accumulator state for cross-rank reduction."""
+        return {
+            "reduction_type": self.reduction_type.value,
+            "samples": self.get_value(),
+        }
+
+    @classmethod
+    def get_reduced_value_from_states(cls, states: List[Dict[str, Any]]) -> list[dict]:
+        """Merge sample states across ranks."""
+        merged = []
+        for s in states:
+            merged.extend(s.get("samples", []))
+        return merged
+
+    def reset(self) -> None:
+        """Clear local samples and reset filter state."""
+        self.is_reset = True
+        self.samples.clear()
+        self._top_heap = []
+        self._bottom_heap = []
+        self._counter = itertools.count()
+
+
 #############
 # Collector #
 #############
@@ -559,7 +662,10 @@ class MetricCollector:
 
         # For PER_RANK_NO_REDUCE backends: stream without reduce
         for backend in self.per_rank_no_reduce_backends:
-            backend.log_stream(metric=metric, global_step=self.global_step)
+            if metric.reduction == Reduce.SAMPLE:
+                asyncio.create_task(backend.log_samples([metric], self.global_step))
+            else:
+                backend.log_stream(metric=metric, global_step=self.global_step)
 
         # Always accumulate for reduction and state return
         key = metric.key
@@ -614,8 +720,19 @@ class MetricCollector:
         if self.per_rank_reduce_backends:
             metrics_for_backends = reduce_metrics_states([states])
 
+            # Split into scalar metrics and sample metrics
+            scalar_metrics = [
+                m for m in metrics_for_backends if m.reduction != Reduce.SAMPLE
+            ]
+            sample_metrics = [
+                m for m in metrics_for_backends if m.reduction == Reduce.SAMPLE
+            ]
+
             for backend in self.per_rank_reduce_backends:
-                await backend.log_batch(metrics_for_backends, global_step)
+                if scalar_metrics:
+                    await backend.log_batch(scalar_metrics, global_step)
+                if sample_metrics:
+                    await backend.log_samples(sample_metrics, global_step)
 
         # Update step counter for streaming backends
         # Note: This is incremented AFTER flush completes, so metrics recorded between
@@ -750,6 +867,16 @@ class ConsoleBackend(LoggerBackend):
     async def finish(self) -> None:
         pass
 
+    async def log_samples(self, samples: List[Metric], step: int) -> None:
+        """Pretty-print sample-level logs to console."""
+
+        logger.info(f"==========  SAMPLE LOGS STEP {step} ==========")
+        for sample in samples:
+            table_name, table_rows = sample.key, sample.value
+            logger.info(f"[{table_name}] ({len(table_rows)} samples)")
+            logger.info(json.dumps(table_rows, indent=2, ensure_ascii=False))
+        logger.info("==============================================\n")
+
 
 class WandbBackend(LoggerBackend):
     """
@@ -786,6 +913,7 @@ class WandbBackend(LoggerBackend):
         )
         self.run = None
         self.process_name = None
+        self._tables: dict[str, "wandb.Table"] = {}
 
     async def init(
         self,
@@ -896,13 +1024,71 @@ class WandbBackend(LoggerBackend):
         # note: here we dont use step since wandb keeps only the latest value for each step
         self.run.log(log_data)
 
+    async def log_samples(self, samples: List[Metric], step: int) -> None:
+        """Log sample-level data incrementally to persistent WandB Tables."""
+        import wandb
+
+        if not self.run:
+            return
+
+        for sample in samples:
+            table_name, table_rows = sample.key, sample.value
+            if not table_rows:
+                continue
+
+            # Convert to list if single sample. This happens when logging stream
+            if isinstance(table_rows, dict):
+                table_rows = [table_rows]
+
+            # If table doesn't exist yet, create it in INCREMENTAL mode
+            if table_name not in self._tables:
+                # Collect all unique columns from all rows
+                columns = set()
+                for row in table_rows:
+                    columns.update(row.keys())
+                columns = sorted(columns)  # Sort for consistent column ordering
+                table = wandb.Table(columns=columns, log_mode="INCREMENTAL")
+                self._tables[table_name] = table
+                logger.debug(
+                    f"WandbBackend: Created new incremental table: {table_name} with columns: {columns}"
+                )
+            else:
+                table = self._tables[table_name]
+
+            # Add rows (fill missing columns with None)
+            for s in table_rows:
+                values = [s.get(c) for c in table.columns]
+                table.add_data(*values)
+
+            # Log the same table object (INCREMENTAL update)
+            # table_name has to end with _table to be recognized by wandb
+            if not table_name.endswith("_table"):
+                table_name += "_table"
+            self.run.log({f"{table_name}": table})
+
     def get_metadata_for_secondary_ranks(self) -> dict[str, Any]:
         if self.run and self.per_rank_share_run:
             return {"shared_run_id": self.run.id}
         return {}
 
     async def finish(self) -> None:
+        import wandb
+
         if self.run:
+            """
+            Convert each incremental table to immutable before finishing
+            as recommended by wandb:
+            https://docs.wandb.ai/models/tables/log_tables#incremental-mode
+            """
+            for table_name, incr_table in self._tables.items():
+                final_table = wandb.Table(
+                    columns=incr_table.columns,
+                    data=incr_table.data,
+                    log_mode="IMMUTABLE",
+                )
+                self.run.log({table_name: final_table})
+                logger.debug(f"WandbBackend: Finalized table {table_name}")
+
             self.run.finish()
             logger.info(f"WandbBackend {self.process_name}: Finished run")
 

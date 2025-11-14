@@ -115,33 +115,64 @@ class TestReduceOperations:
 
     def test_single_state(self):
         """Test reduce_metrics_states with single state."""
-        states = [{"loss": {"reduction_type": "mean", "sum": 10.0, "count": 2}}]
-        result = reduce_metrics_states(states)
-        assert len(result) == 1
-        assert result[0].key == "loss"
-        assert result[0].value == 5.0
-        assert result[0].reduction == Reduce.MEAN
+        states = [
+            {
+                "loss": {"reduction_type": "mean", "sum": 10.0, "count": 2},
+                "rollout/sample": {
+                    "reduction_type": "sample",
+                    "samples": [{"id": 1, "reward": 0.5}],
+                },
+            }
+        ]
+        metrics = reduce_metrics_states(states)
+        assert len(metrics) == 2
+        # Convert to dict for easier testing
+        result_dict = {m.key: (m.value, m.reduction) for m in metrics}
+
+        assert result_dict["loss"][0] == 5.0
+        assert result_dict["loss"][1] == Reduce.MEAN
+
+        assert result_dict["rollout/sample"][0] == [{"id": 1, "reward": 0.5}]
+        assert result_dict["rollout/sample"][1] == Reduce.SAMPLE
 
     def test_multiple_states(self):
         """Test reduce_metrics_states with multiple states."""
         states = [
-            {"loss": {"reduction_type": "mean", "sum": 10.0, "count": 2}},
-            {"loss": {"reduction_type": "mean", "sum": 20.0, "count": 3}},
+            {
+                "loss": {"reduction_type": "mean", "sum": 10.0, "count": 2},
+                "rollout/sample": {
+                    "reduction_type": "sample",
+                    "samples": [{"id": 1, "reward": 0.5}],
+                },
+            },
+            {
+                "loss": {"reduction_type": "mean", "sum": 20.0, "count": 3},
+                "rollout/sample": {
+                    "reduction_type": "sample",
+                    "samples": [{"id": 2, "reward": 0.8}],
+                },
+            },
             {"accuracy": {"reduction_type": "sum", "total": 15.0}},
         ]
-        result = reduce_metrics_states(states)
+        metrics = reduce_metrics_states(states)
+
+        assert len(metrics) == 3
 
         # Convert to dict for easier testing
-        result_dict = {metric.key: metric.value for metric in result}
-        assert result_dict["loss"] == 30.0 / 5.0  # 6.0
-        assert result_dict["accuracy"] == 15.0
+        result_dict = {m.key: (m.value, m.reduction) for m in metrics}
 
-        # Also check reduction types
-        for metric in result:
-            if metric.key == "loss":
-                assert metric.reduction == Reduce.MEAN
-            elif metric.key == "accuracy":
-                assert metric.reduction == Reduce.SUM
+        # Check scalar reductions
+        assert result_dict["loss"][0] == 30.0 / 5.0  # 6.0
+        assert result_dict["loss"][1] == Reduce.MEAN
+        assert result_dict["accuracy"][0] == 15.0
+        assert result_dict["accuracy"][1] == Reduce.SUM
+
+        # Check sample concatenation
+        assert result_dict["rollout/sample"][0] == [
+            {"id": 1, "reward": 0.5},
+            {"id": 2, "reward": 0.8},
+        ]
+        assert result_dict["rollout/sample"][1] == Reduce.SAMPLE
 
     def test_mismatched_reduction_types_raises_error(self):
         """Test reduce_metrics_states raises error for mismatched reduction types."""

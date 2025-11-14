@@ -29,7 +29,7 @@ from forge.controller.provisioner import init_provisioner, shutdown
 from forge.data.rewards import MathReward, ThinkingReward
 from forge.data_models.completion import Completion
 from forge.observability.metric_actors import get_or_create_metric_logger
-from forge.observability.metrics import record_metric, Reduce
+from forge.observability.metrics import record_episode_sample, record_metric, Reduce
 from forge.observability.perf_tracker import Tracer
 
 from forge.types import LauncherConfig, ProvisionerConfig
@@ -47,10 +47,13 @@ class Episode:
     request_len: int
     response_len: int
     target: Any | None = None
+    request: str | None = None
+    response: str | None = None
     # Processed data
     completion: Completion | None = None
     ref_logprobs: torch.Tensor | None = None
     reward: float | None = None
+    reward_breakdown: dict[str, float] | None = None
     advantage: float | None = None
 
     @property
@@ -72,6 +75,32 @@ class Episode:
             diff = self.response_len - tensor.shape[0]
             tensor = F.pad(tensor, (0, diff), value=self.pad_id)
         return tensor
+
+    def to_dict(self, exclude: list[str] | None = None) -> dict[str, Any]:
+        """Convert episode to dict, optionally excluding specified fields."""
+        result = {
+            "episode_id": self.episode_id,
+            "policy_version": self.policy_version,
+            "prompt": self.request,
+            "response": self.response,
+            "target": str(self.target),
+            "reward": self.reward,
+            "advantage": self.advantage,
+            "request_len": self.request_len,
+            "response_len": self.response_len,
+            "pad_id": self.pad_id,
+            "ref_logprobs": self.ref_logprobs,
+            "completion": self.completion,
+        }
+
+        if self.reward_breakdown is not None and "reward_breakdown" not in exclude:
+            result.update(self.reward_breakdown)
+
+        if exclude:
+            for key in exclude:
+                result.pop(key, None)
+
+        return result
 
 
 # Represents the group (G) of episodes in GRPO
@@ -144,8 +173,11 @@ class RewardActor(ForgeActor):
     reward_functions: list[Callable]
 
     @endpoint
-    async def evaluate_response(self, prompt: str, response: str, target: str) -> float:
+    async def evaluate_response(
+        self, prompt: str, response: str, target: str
+    ) -> (dict[str, float], float):
         total_rewards = 0.0
+        reward_breakdown = {}  # reward breakdown by function
         for reward_fn in self.reward_functions:
             reward = reward_fn(prompt, response, target)
             total_rewards += reward
@@ -154,6 +186,7 @@ class RewardActor(ForgeActor):
             reward_fn_name = getattr(
                 reward_fn, "__name__", reward_fn.__class__.__name__
             )
+            reward_breakdown[reward_fn_name] = reward
             # per function reward
             record_metric(
                 f"reward/evaluate_response/sum_{reward_fn_name}_reward",
@@ -183,8 +216,8 @@ class RewardActor(ForgeActor):
                 Reduce.SUM,
             )
 
-        avg_reward = total_rewards / len(self.reward_functions)
-        return avg_reward
+        avg_reward: float = total_rewards / len(self.reward_functions)
+        return reward_breakdown, avg_reward
 
 
 @dataclass
@@ -386,9 +419,14 @@ async def main(cfg: DictConfig):
                     request_len=max_req_tokens,
                     response_len=max_res_tokens,
                     target=target,
+                    request=prompt,
+                    response=response.text,
                     completion=response,
                 )
-                episode.reward = await reward_actor.evaluate_response.route(
+                (
+                    episode.reward_breakdown,
+                    episode.reward,
+                ) = await reward_actor.evaluate_response.route(
                     prompt=prompt, response=response.text, target=target
                 )
                 episodes.append(episode)
@@ -412,6 +450,9 @@ async def main(cfg: DictConfig):
             for episode, advantage in zip(episodes, advantages):
                 episode.advantage = advantage
                 await replay_buffer.add.call_one(episode)
+                record_episode_sample(
+                    "main_samples/continuous_rollouts/sample_table", episode
+                )
 
             rollout_count += 1
             record_metric(

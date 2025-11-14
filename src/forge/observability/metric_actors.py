@@ -26,6 +26,7 @@ from forge.observability.metrics import (
     LoggerBackend,
     LoggingMode,
     MetricCollector,
+    Reduce,
     reduce_metrics_states,
 )
 
@@ -432,9 +433,20 @@ class GlobalLoggingActor(ForgeActor):
             # Reduce metrics from states
             reduced_metrics = reduce_metrics_states(all_local_states)
 
+            # Split into scalar metrics and sample metrics
+            scalar_metrics = [
+                m for m in reduced_metrics if m.reduction != Reduce.SAMPLE
+            ]
+            sample_metrics = [
+                m for m in reduced_metrics if m.reduction == Reduce.SAMPLE
+            ]
+
             # Log to global backends
             for backend_name, backend in self.global_logger_backends.items():
-                await backend.log_batch(reduced_metrics, global_step)
+                if scalar_metrics:
+                    await backend.log_batch(scalar_metrics, global_step)
+                if sample_metrics:
+                    await backend.log_samples(sample_metrics, global_step)
 
     @endpoint
     async def has_fetcher(self, proc_id: str) -> bool:
