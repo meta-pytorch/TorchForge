@@ -7,6 +7,7 @@
 # Usage: python -m apps.grpo.main --config apps/grpo/qwen3_1_7b.yaml
 
 import asyncio
+import logging
 import time
 import uuid
 from dataclasses import dataclass
@@ -49,7 +50,8 @@ class Episode:
     target: Any | None = None
     # Processed data
     completion: Completion | None = None
-    ref_logprobs: torch.Tensor | None = None
+    behavior_logprobs: torch.Tensor | None = None  # Logprobs from the policy that generated the response
+    ref_logprobs: torch.Tensor | None = None  # Logprobs from the reference model
     reward: float | None = None
     advantage: float | None = None
 
@@ -71,6 +73,15 @@ class Episode:
         if tensor.shape[0] < self.response_len:  # right pad
             diff = self.response_len - tensor.shape[0]
             tensor = F.pad(tensor, (0, diff), value=self.pad_id)
+        return tensor
+    
+    @property
+    def behavior_logprobs_tensor(self) -> torch.Tensor:
+        """Get behavior logprobs padded to response_len."""
+        tensor: torch.Tensor = self.behavior_logprobs
+        if tensor.shape[0] < self.response_len:  # right pad with zeros (will be masked)
+            diff = self.response_len - tensor.shape[0]
+            tensor = F.pad(tensor, (0, diff), value=0.0)
         return tensor
 
 
@@ -97,6 +108,9 @@ def collate(
         response = [e.response_tensor for e in batch]
         response = torch.stack(response)  # [b x s]
 
+        behavior_logprobs = [e.behavior_logprobs_tensor for e in batch]
+        behavior_logprobs = torch.stack(behavior_logprobs).squeeze()  # [b x s]
+
         ref_logprobs = [e.ref_logprobs for e in batch]
         ref_logprobs = torch.stack(ref_logprobs).squeeze()  # [b x s]
 
@@ -109,6 +123,7 @@ def collate(
         input = {"tokens": torch.cat([request, response], dim=1)}
         target = {
             "response": response,
+            "behavior_logprobs": behavior_logprobs,
             "ref_logprobs": ref_logprobs,
             "advantages": advantages,
             "padding_mask": mask,
@@ -119,17 +134,23 @@ def collate(
 
 
 # Note: This is also available in losses.grpo_loss via `SimpleGRPOLoss`
+_grpo_logger = logging.getLogger(__name__)
+
 def simple_grpo_loss(
     logits: torch.Tensor,
     response: torch.Tensor,
+    behavior_logprobs: torch.Tensor,
     ref_logprobs: torch.Tensor,
     advantages: torch.Tensor,
     padding_mask: torch.Tensor,
     beta: float = 0.1,
 ) -> torch.Tensor:
+    # Sanity check: behavior_logprobs should not be None
+    assert behavior_logprobs is not None, "behavior_logprobs is None!"
+    
     logprobs: torch.Tensor = compute_logprobs(logits, response)
     kl = torch.exp(ref_logprobs - logprobs) - (ref_logprobs - logprobs) - 1
-    per_token_policy_loss = torch.exp(logprobs - logprobs.detach()) * advantages
+    per_token_policy_loss = torch.exp(logprobs - behavior_logprobs.detach()) * advantages
     per_token_loss = -(per_token_policy_loss - beta * kl)
     loss = (
         ((per_token_loss * padding_mask).sum(dim=1))
@@ -380,6 +401,14 @@ async def main(cfg: DictConfig):
                 dtype=torch.long,
             )
             for i, response in enumerate(responses):
+                # Extract behavior policy logprobs from the completion
+                behavior_logprobs = response.logprobs
+                if behavior_logprobs is None:
+                    raise ValueError(
+                        "Behavior logprobs are not available in the completion. "
+                        "Please enable logprobs in the sampling_params configuration."
+                    )
+                
                 episode = Episode(
                     episode_id=str(uuid.uuid4()),
                     pad_id=pad_id,
@@ -387,6 +416,7 @@ async def main(cfg: DictConfig):
                     response_len=max_res_tokens,
                     target=target,
                     completion=response,
+                    behavior_logprobs=behavior_logprobs,
                 )
                 episode.reward = await reward_actor.evaluate_response.route(
                     prompt=prompt, response=response.text, target=target

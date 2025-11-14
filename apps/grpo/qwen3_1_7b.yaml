@@ -42,6 +42,7 @@ policy:
     max_tokens: ${max_res_tokens}
     temperature: 1.0
     top_p: 1.0
+    logprobs: 1  # Enable logprobs for behavior policy
 
 # Trainer configuration
 trainer:
