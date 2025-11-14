@@ -1,0 +1,33 @@
+# baseline.yaml shows 5 key config patterns
+
+output_dir: /tmp/torchtune/llama3_2_1B/full
+
+# PATTERN 1: Simple Component Instantiation
+tokenizer:
+  _target_: mock.llama3_tokenizer
+  path: /tmp/Llama-3.2-1B-Instruct/original/tokenizer.model
+
+# PATTERN 2: Component with Nested Instantiation
+model:
+  _target_: mock.llama3_2_1b
+  # Nested component: attention config
+  attn_config:
+    _target_: mock.MultiHeadAttention
+    num_heads: 32
+
+# PATTERN 3: Component Needing Runtime Args (Partial)
+optimizer:
+  _target_: torch.optim.AdamW
+  lr: 2e-5
+  _partial_: true
+  # params: None #will be passed at instantiation time (not known now)
+
+# PATTERN 4: Non-Instantiated Config Block (Plain Data)
+data_args:
+  batch_size: 4
+  shuffle: True
+
+# PATTERN 5: Plain Top-Level Hyperparameters
+# Training params
+epochs: 1
+gradient_accumulation_steps: 8

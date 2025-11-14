@@ -1,0 +1,12 @@
+# @package _global_
+
+# Variant config: inherits from baseline with different batch size
+# This demonstrates Hydra's config composition via defaults list
+
+defaults:
+  - /baseline
+  - _self_
+
+# Override batch size (applied after baseline due to _self_ position)
+data_args:
+  batch_size: 32
