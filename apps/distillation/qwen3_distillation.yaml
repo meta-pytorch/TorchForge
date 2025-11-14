@@ -1,0 +1,142 @@
+# Online Distillation: Student (Qwen3-1.7B) learns from Teacher (Qwen3-32B)
+# >>> python -m apps.distillation.main --config apps/distillation/qwen3_distillation.yaml
+
+# Global configuration
+group_size: 8
+local_batch_size: 16 # per-device batch size
+max_req_tokens: 1024
+max_res_tokens: 1024
+student_model: "Qwen/Qwen3-1.7B"
+teacher_model: "Qwen/Qwen3-32B"
+off_by_n: 1 # Off by one by default
+
+# Main loop configuration
+rollout_threads: 1   # Recommended to set equal to student_generator.num_replicas
+
+# Observability configuration
+metric_logging:
+  wandb:
+    project: distillation-training
+    group: distillation_exp_${oc.env:USER}
+    logging_mode: global_reduce # global_reduce, per_rank_reduce, per_rank_no_reduce
+  console:
+    logging_mode: global_reduce
+
+# Dataset configuration
+dataset:
+  path: "openai/gsm8k"
+  revision: "main"
+  data_split: "train"
+  streaming: true
+  model: ${student_model}  # Use student model tokenizer
+
+# Student Generator configuration (vLLM)
+student_generator:
+  engine_args:  # https://docs.vllm.ai/en/v0.10.0/api/vllm/engine/arg_utils.html#vllm.engine.arg_utils.EngineArgs
+    model: ${student_model}
+    tensor_parallel_size: 1
+    pipeline_parallel_size: 1
+    enforce_eager: false
+  sampling_params:  # https://docs.vllm.ai/en/v0.10.0/api/vllm/sampling_params.html#vllm.sampling_params.SamplingParams
+    n: ${group_size}
+    max_tokens: ${max_res_tokens}
+    temperature: 1.0
+    top_p: 1.0
+
+# Trainer configuration (Student model training)
+trainer:
+  model:
+    name: qwen3
+    flavor: 1.7B
+    hf_assets_path: hf://${student_model}
+  optimizer:
+    name: AdamW
+    lr: 1e-5
+    eps: 1e-8
+  lr_scheduler:
+    warmup_steps: 1
+  training:
+    local_batch_size: ${local_batch_size}
+    seq_len: ${sum:${max_req_tokens},${max_res_tokens}}  # seq_len >= max_req_tokens + max_res_tokens
+    max_norm: 1.0
+    steps: 1000000
+    dtype: bfloat16
+    gc_freq: 1
+  compile:
+    enable: false
+  parallelism:
+    data_parallel_replicate_degree: 1
+    data_parallel_shard_degree: 1
+    tensor_parallel_degree: 1
+    pipeline_parallel_degree: 1
+    context_parallel_degree: 1
+    expert_parallel_degree: 1
+    disable_loss_parallel: true
+  checkpoint:
+    enable: true
+    folder: ./checkpoint              # The folder to save checkpoints to.
+    initial_load_path: hf://${student_model}  # The path to load the initial checkpoint from. Ignored if `folder` exists.
+    initial_load_in_hf: true          # If true, interpret initial_load_path as a HuggingFace model repo
+    last_save_in_hf: true
+    interval: 500
+    async_mode: "disabled"
+  activation_checkpoint:
+    mode: selective
+    selective_ac_option: op
+
+# Replay buffer configuration
+replay_buffer:
+  batch_size: ${local_batch_size}
+  max_policy_age: ${off_by_n}
+  dp_size: ${trainer.parallelism.data_parallel_shard_degree} # Must equal trainer DP degree
+
+# Teacher model configuration (frozen, larger model)
+teacher_model:
+  model:
+    name: qwen3
+    flavor: 32B
+    hf_assets_path: hf://${teacher_model}
+  training:
+    seq_len: ${trainer.training.seq_len}
+    dtype: bfloat16
+    gc_freq: 1
+  compile:
+    enable: false
+  parallelism:
+    data_parallel_replicate_degree: 1
+    data_parallel_shard_degree: 1
+    tensor_parallel_degree: 4  # 32B model needs more parallelism
+    pipeline_parallel_degree: 1
+    context_parallel_degree: 1
+    expert_parallel_degree: 1
+  checkpoint:
+    enable: true
+    initial_load_path: hf://${teacher_model}
+    initial_load_in_hf: true
+
+# All resource allocations
+services:
+  student_generator:
+    procs: ${student_generator.engine_args.tensor_parallel_size}
+    num_replicas: 1
+    mesh_name: student_generator
+    with_gpus: true
+  teacher_model:
+    procs: ${teacher_model.parallelism.tensor_parallel_degree}
+    num_replicas: 1
+    mesh_name: teacher_model
+    with_gpus: true
+
+actors:
+  dataset:
+    procs: 1
+    with_gpus: false
+    mesh_name: dataset
+  trainer:
+    procs: 1
+    with_gpus: true
+    mesh_name: trainer
+  replay_buffer:
+    procs: 1
+    with_gpus: false
+    mesh_name: replay_buffer
