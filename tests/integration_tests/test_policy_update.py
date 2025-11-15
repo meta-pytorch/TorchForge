@@ -9,6 +9,7 @@ import logging
 import shutil
 from pathlib import Path
 
+import monarch
 import pytest
 import pytest_asyncio
 
@@ -22,9 +23,19 @@ from forge.controller.provisioner import init_provisioner
 from forge.controller.service.service import uuid
 from forge.types import LauncherConfig, ProvisionerConfig
 from forge.util.config import resolve_hf_hub_paths
+from forge.util.weight_verification import (
+    verify_weights_all_zeros,
+    verify_weights_changed,
+    WeightSnapshot,
+)
 from monarch.actor import endpoint
 
 from omegaconf import DictConfig, OmegaConf
+
+# Workaround for monarch mesh shutdown exit code during teardown
+# Without this, proc_mesh.stop will raise exit code 1 after test completes
+monarch.actor.unhandled_fault_hook = lambda failure: None
+
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -39,11 +50,10 @@ logger.setLevel(logging.INFO)
 """
 Run tests:
 
+TORCHSTORE_RDMA_ENABLED=0  \
 PYTHONPATH=. pytest -s tests/integration_tests/test_policy_update.py::TestWeightSync::test_sanity_check \
-    --config tests/integration_tests/fixtures/qwen3_1_7b_tp.yaml --use_dcp=false
+    --config tests/integration_tests/fixtures/qwen3_1_7b_tp.yaml
 
-PYTHONPATH=. pytest -s tests/integration_tests/test_policy_update.py::TestWeightSync::test_sanity_check \
-        --config apps/grpo/qwen3_8b.yaml
 """
 
 # Temp directory won't work for multi-node because NFS does not cover the tmp path
@@ -81,70 +91,53 @@ def _load_config(config_path: str) -> DictConfig:
 def _test_validate_params_unchanged(
     prev_params, curr_model, logger
 ) -> Exception | None:
-    """Validate that current parameters are the same as prev_params."""
-    verified = set()
-    skipped = set()
-    logger.info(
-        f"Validating model params, all named_parameters() = {curr_model.named_parameters()}"
+    """Validate that current parameters are the same as prev_params.
+
+    Uses the new weight_verification utility for robust checking.
+    """
+    prev_snapshot = WeightSnapshot(params=prev_params, version=None)
+    result = verify_weights_changed(
+        prev_snapshot, curr_model, atol=1e-3, rtol=1e-2, verbose=False
     )
-    errs = []
-    for name, param in curr_model.named_parameters():
-        if not torch.is_floating_point(param):
-            logger.info(f"Skipping non-float param {name}")
-            skipped.add(name)
-            continue
-        try:
-            assert name in prev_params, f"Param {name} not found in prev_params"
-            assert torch.allclose(
-                prev_params[name], param.cpu(), atol=1e-3, rtol=1e-2
-            ), (
-                f"current param {name} does not match expected value; "
-                f"previous param ({prev_params[name].size()})= {prev_params[name]}; "
-                f"expected = {prev_params[name]} vs got = {param.cpu().size()} {param.cpu()}"
-            )
-            verified.add(name)
-        except Exception as e:
-            errs.append((name, e))
-    logger.info(f"Verified params = {verified}")
-    logger.info(f"Skipped params = {skipped}")
-    if errs:
-        logger.error(
-            f"Validation failed for the following params: {[e[0] for e in errs]}"
+
+    logger.info(
+        f"Validation: {result.num_params_checked} params checked, "
+        f"{result.num_params_changed} changed, {result.num_params_unchanged} unchanged"
+    )
+
+    # We EXPECT no changes for this validation
+    if result.weights_changed:
+        error_msg = (
+            f"Weights unexpectedly changed! {result.num_params_changed} params changed "
+            f"(max_delta={result.max_delta:.6e}). Changed params: {result.changed_params[:5]}"
         )
-        return AssertionError(f"Validation failed: {errs}")
+        logger.error(error_msg)
+        return AssertionError(error_msg)
 
 
 def _test_validate_params_all_zeros(
     prev_params, curr_model, logger
 ) -> Exception | None:
-    """Validate all parameters are set to zero. prev_params is actually not used."""
-    _ = prev_params
-    verified = set()
-    skipped = set()
-    logger.info(
-        f"Validating model params, all named_parameters() = {curr_model.named_parameters()}"
+    """Validate all parameters are set to zero."""
+    _ = prev_params  # Unused
+
+    all_zeros, zero_params, non_zero_params = verify_weights_all_zeros(
+        curr_model, atol=1e-4, rtol=1e-3, verbose=False
     )
-    errs = []
-    for name, param in curr_model.named_parameters():
-        if not torch.is_floating_point(param):
-            logger.info(f"Skipping non-float param {name}")
-            skipped.add(name)
-            continue
-        try:
-            param = param.cpu()
-            assert torch.allclose(
-                torch.zeros_like(param), param, atol=1e-4, rtol=1e-3
-            ), f"param {name} is not zero."
-            verified.add(name)
-        except Exception as e:
-            errs.append((name, e))
-    logger.info(f"Verified params = {verified}")
-    logger.info(f"Skipped params = {skipped}")
-    if errs:
-        logger.error(
-            f"Validation failed for the following params: {[e[0] for e in errs]}"
+
+    logger.info(
+        f"Zero validation: {len(zero_params)} zero params, {len(non_zero_params)} non-zero params"
+    )
+
+    if not all_zeros:
+        error_msg = (
+            f"Not all params are zero! {len(non_zero_params)} non-zero params found. "
+            f"First few non-zero: {non_zero_params[:5]}"
         )
-        return AssertionError(f"Validation failed: {errs}")
+        logger.error(error_msg)
+        return AssertionError(error_msg)
+
+    return None
 
 
 @pytest_asyncio.fixture(autouse=True)
@@ -211,11 +204,14 @@ async def _setup_and_teardown(request):
     # ---- teardown ---- #
     logger.info("Shutting down services and cleaning up DCP directory..")
 
-    await asyncio.gather(
-        policy.shutdown(),
-        ts.shutdown(),
-        TitanTrainer.shutdown(titan_trainer),
-    )
+    # Call cleanup to destroy process group before shutdown
+    # This prevents TCPStore connection errors from NCCL heartbeat threads
+    await titan_trainer.cleanup.call()
+
+    # Shutdown sequentially to avoid race conditions
+    await policy.shutdown()
+    await TitanTrainer.shutdown(titan_trainer)
+    await ts.shutdown()
 
     # Cleanup DCP directory
     path = Path(TEST_DCP_DIR)
